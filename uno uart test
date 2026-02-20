@@ -1,0 +1,31 @@
+#include <SoftwareSerial.h>
+
+// 10 = RX (from ESP32 TX)
+// 11 = TX (to ESP32 RX through divider)
+SoftwareSerial esp(10, 11);
+
+void setup() {
+  Serial.begin(115200);     // USB monitor
+  esp.begin(9600);          // ESP32 UART
+
+  Serial.println("UNO Boot OK");
+}
+
+void loop() {
+
+  // If data comes from ESP32
+  if (esp.available()) {
+
+    String msg = esp.readStringUntil('\n');
+    msg.trim();   // remove \r or spaces
+
+    Serial.print("UNO <- ");
+    Serial.println(msg);
+
+    // Reply if message is PING
+    if (msg == "PING") {
+      Serial.println("UNO -> PONG");
+      esp.println("PONG");
+    }
+  }
+}
