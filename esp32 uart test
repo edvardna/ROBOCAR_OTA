@@ -1,0 +1,35 @@
+// ESP32-C5 ↔ UNO UART TEST
+
+#define ESP_RX 25
+#define ESP_TX 26
+
+unsigned long lastSend = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("ESP32 Boot OK");
+
+  Serial1.begin(9600, SERIAL_8N1, ESP_RX, ESP_TX);
+  Serial.println("UART started (9600)");
+}
+
+void loop() {
+
+  // Send PING every 2 seconds
+  if (millis() - lastSend > 2000) {
+    lastSend = millis();
+    Serial.println("ESP32 -> PING");
+    Serial1.println("PING");
+  }
+
+  // Read reply
+  if (Serial1.available()) {
+    String msg = Serial1.readStringUntil('\n');
+    Serial.print("ESP32 <- ");
+    Serial.println(msg);
+  }
+
+  delay(5);
+}
