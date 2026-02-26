@@ -1,0 +1,108 @@
+#include <SoftwareSerial.h>
+
+// ================= UART =================
+// 10 = RX (from ESP32 TX)
+// 11 = TX (to ESP32 RX through divider)
+SoftwareSerial esp(10, 11);
+
+// ================= SENSOR PINS =================
+#define TRIG_ALL 6
+
+#define ECHO_RIGHT  2
+#define ECHO_FRONT  3
+#define ECHO_LEFT   4
+#define ECHO_REAR   5
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);   // USB debug
+  esp.begin(9600);        // UART to ESP32
+
+  pinMode(TRIG_ALL, OUTPUT);
+
+  pinMode(ECHO_RIGHT, INPUT);
+  pinMode(ECHO_FRONT, INPUT);
+  pinMode(ECHO_LEFT, INPUT);
+  pinMode(ECHO_REAR, INPUT);
+
+  digitalWrite(TRIG_ALL, LOW);
+
+  Serial.println("UNO Sensor Node Ready");
+}
+
+// ================= RAW READ =================
+long readRaw(int echoPin) {
+
+  digitalWrite(TRIG_ALL, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_ALL, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_ALL, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 25000);
+
+  if (duration == 0) return -1;
+
+  long distance = duration * 0.034 / 2;
+
+  if (distance < 2 || distance > 400) return -1;
+
+  return distance;
+}
+
+// ================= MEDIAN FILTER =================
+long median3(long a, long b, long c) {
+  if (a > b) { long t=a; a=b; b=t; }
+  if (b > c) { long t=b; b=c; c=t; }
+  if (a > b) { long t=a; a=b; b=t; }
+  return b;
+}
+
+long readFiltered(int echoPin) {
+
+  long d1 = readRaw(echoPin);
+  delay(5);
+  long d2 = readRaw(echoPin);
+  delay(5);
+  long d3 = readRaw(echoPin);
+
+  if (d1 < 0 || d2 < 0 || d3 < 0)
+    return max(d1, max(d2, d3));
+
+  return median3(d1, d2, d3);
+}
+
+// ================= LOOP =================
+void loop() {
+
+  long right = readFiltered(ECHO_RIGHT);
+  delay(20);
+
+  long front = readFiltered(ECHO_FRONT);
+  delay(20);
+
+  long left  = readFiltered(ECHO_LEFT);
+  delay(20);
+
+  long rear  = readFiltered(ECHO_REAR);
+
+  // ===== USB DEBUG =====
+  Serial.print("R:"); Serial.print(right);
+  Serial.print(" F:"); Serial.print(front);
+  Serial.print(" L:"); Serial.print(left);
+  Serial.print(" B:"); Serial.println(rear);
+
+  // ===== SEND JSON TO ESP32 =====
+  esp.print("{\"right\":");
+  esp.print(right);
+  esp.print(",\"front\":");
+  esp.print(front);
+  esp.print(",\"left\":");
+  esp.print(left);
+  esp.print(",\"rear\":");
+  esp.print(rear);
+  esp.println("}");
+
+  delay(50);
+}
