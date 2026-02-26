@@ -1,0 +1,41 @@
+// ===== L298N MOTOR TEST (Updated Pins) =====
+// Motor A: IN1=GPIO2, IN2=GPIO3
+// Motor B: IN3=GPIO0, IN4=GPIO1
+
+#define IN1 2
+#define IN2 3
+#define IN3 0
+#define IN4 1
+
+void stopAll() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void motorA_forward() { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+void motorA_reverse() { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+
+void motorB_forward() { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+void motorB_reverse() { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopAll();
+}
+
+void loop() {
+  // ---- Motor A ----
+  motorA_forward(); delay(1000);
+  motorA_reverse(); delay(1000);
+  stopAll();        delay(500);
+
+  // ---- Motor B ----
+  motorB_forward(); delay(1000);
+  motorB_reverse(); delay(1000);
+  stopAll();        delay(1000);
+}
