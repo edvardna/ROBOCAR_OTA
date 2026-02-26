@@ -1,7 +1,7 @@
 // ESP32-C5 ↔ UNO UART TEST
 
-#define ESP_RX 25
-#define ESP_TX 26
+#define ESP_RX 25 //for old esp  for new it is 24
+#define ESP_TX 26 //for old esp  for new it is 23
 
 unsigned long lastSend = 0;
 
