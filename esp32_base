@@ -1,0 +1,789 @@
+/*
+  ROBOCAR ESP32-C5 (FULL CODE) — CLOUD CONTROL + LIVE STATUS FIX
+
+  ✅ WiFi + Web D-Pad controller
+  ✅ Motor enable toggle + live status
+  ✅ 4x mecanum motor mapping (FL/FR/RL/RR)
+  ✅ UART RX from UNO sensors (JSON) -> MQTT publish + Web display
+  ✅ OLED 128x32 (SDA=4, SCL=5) shows “system status”
+  ✅ PRIVATE GitHub OTA (PAT) using releases/assets/{asset_id} + redirect follow
+
+  ✅ NEW: MQTT remote control subscribe (robocar/control)
+  ✅ NEW: Safety watchdog auto-STOP if no control msg within 500ms
+  ✅ NEW: Stop motors on MQTT disconnect
+  ✅ FIX: publishStatusOnce() after control so Netlify UI updates live
+
+  IMPORTANT (YOUR BOARD IS 4MB FLASH):
+  Tools -> Partition Scheme:
+  ✅ "Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)"
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include "secrets.h"   // must contain: const char* github_pat = "ghp_...";
+
+// ================= WIFI =================
+const char* ssid     = "EDWARD";
+const char* password = "Edward2000";
+
+// ================= HIVEMQ =================
+const char* mqtt_server = "459c3601de32431485cd34dbf54a23d2.s1.eu.hivemq.cloud";
+const int   mqtt_port   = 8883;
+const char* mqtt_user   = "robocar";
+const char* mqtt_pass   = "Robocar1!";
+
+const char* topic_sensors = "robocar/sensors";
+const char* topic_status  = "robocar/status";
+const char* topic_control = "robocar/control";   // NEW
+
+// ================= UART (UNO -> ESP32) =================
+#define ESP_RX 24
+#define ESP_TX 23
+
+// ================= MOTORS (L298N x2) =================
+// Mapping you confirmed:
+// Front Left  (FL): IN1=GPIO2  IN2=GPIO3
+// Front Right (FR): IN1=GPIO0  IN2=GPIO1
+// Rear Left   (RL): IN1=GPIO6  IN2=GPIO7
+// Rear Right  (RR): IN1=GPIO8  IN2=GPIO9
+#define FL_IN1 2
+#define FL_IN2 3
+#define FR_IN1 0
+#define FR_IN2 1
+#define RL_IN1 6
+#define RL_IN2 7
+#define RR_IN1 8
+#define RR_IN2 9
+
+// ================= OLED (128x32 I2C) =================
+#define OLED_SDA 4
+#define OLED_SCL 5
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
+
+// ================= OTA SETTINGS =================
+const char* github_owner           = "edvardna";
+const char* github_repo            = "ROBOCAR_OTA";
+const char* firmware_asset_name    = "ROBOCAR.ino.bin";
+const char* currentFirmwareVersion = "1.0.5";
+
+// check every 60s (change if you want)
+unsigned long lastUpdateCheck = 0;
+const unsigned long updateCheckInterval = 60000;
+
+// ================= GLOBALS =================
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+WebServer server(80);
+
+int rightDist = -1;
+int frontDist = -1;
+int leftDist  = -1;
+int rearDist  = -1;
+
+String lastJson = "";
+unsigned long lastMqttAttempt = 0;
+
+// Motor state
+bool motorEnabled = false;
+String currentMove = "STOP"; // STOP/FORWARD/BACKWARD/LEFT/RIGHT/ROTATE_LEFT/ROTATE_RIGHT
+
+// NEW: safety watchdog for remote control
+unsigned long lastControlMsg = 0;
+const unsigned long controlTimeout = 500; // ms (auto STOP if no control updates)
+
+// For MQTT disconnect safety
+bool wasMqttConnected = false;
+
+// ================= HELPERS: SERIAL + OLED =================
+String bootLine = "BOOT -> done";
+String wifiLine = "WIFI -> ...";
+String mqttLine = "MQTT -> ...";
+String otaLine  = "OTA  -> idle";
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  display.print("VER:");
+  display.println(currentFirmwareVersion);
+
+  display.print("IP:");
+  display.println(WiFi.isConnected() ? WiFi.localIP().toString() : String("-"));
+
+  display.print("MQTT:");
+  display.println(client.connected() ? "OK" : "WAIT");
+
+  display.print("MOVE:");
+  display.println(motorEnabled ? currentMove : "DISABLED");
+
+  display.display();
+}
+
+// =====================================================
+// ================= MOTOR CONTROL =====================
+// =====================================================
+void stopAll() {
+  digitalWrite(FL_IN1, LOW); digitalWrite(FL_IN2, LOW);
+  digitalWrite(FR_IN1, LOW); digitalWrite(FR_IN2, LOW);
+  digitalWrite(RL_IN1, LOW); digitalWrite(RL_IN2, LOW);
+  digitalWrite(RR_IN1, LOW); digitalWrite(RR_IN2, LOW);
+}
+
+void setMotorPins(int in1, int in2, int dir) {
+  // dir: +1 forward, -1 reverse, 0 stop
+  if (dir == 0) { digitalWrite(in1, LOW); digitalWrite(in2, LOW); return; }
+  if (dir > 0)  { digitalWrite(in1, HIGH); digitalWrite(in2, LOW); return; }
+  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
+}
+
+void applyMove() {
+  if (!motorEnabled) { stopAll(); return; }
+
+  if (currentMove == "FORWARD") {
+    setMotorPins(FL_IN1, FL_IN2, +1);
+    setMotorPins(FR_IN1, FR_IN2, +1);
+    setMotorPins(RL_IN1, RL_IN2, +1);
+    setMotorPins(RR_IN1, RR_IN2, +1);
+  } else if (currentMove == "BACKWARD") {
+    setMotorPins(FL_IN1, FL_IN2, -1);
+    setMotorPins(FR_IN1, FR_IN2, -1);
+    setMotorPins(RL_IN1, RL_IN2, -1);
+    setMotorPins(RR_IN1, RR_IN2, -1);
+  } else if (currentMove == "LEFT") { // strafe left (mecanum)
+    setMotorPins(FL_IN1, FL_IN2, -1);
+    setMotorPins(FR_IN1, FR_IN2, +1);
+    setMotorPins(RL_IN1, RL_IN2, +1);
+    setMotorPins(RR_IN1, RR_IN2, -1);
+  } else if (currentMove == "RIGHT") { // strafe right (mecanum)
+    setMotorPins(FL_IN1, FL_IN2, +1);
+    setMotorPins(FR_IN1, FR_IN2, -1);
+    setMotorPins(RL_IN1, RL_IN2, -1);
+    setMotorPins(RR_IN1, RR_IN2, +1);
+  } else if (currentMove == "ROTATE_LEFT") { // rotate CCW
+    setMotorPins(FL_IN1, FL_IN2, -1);
+    setMotorPins(FR_IN1, FR_IN2, +1);
+    setMotorPins(RL_IN1, RL_IN2, -1);
+    setMotorPins(RR_IN1, RR_IN2, +1);
+  } else if (currentMove == "ROTATE_RIGHT") { // rotate CW
+    setMotorPins(FL_IN1, FL_IN2, +1);
+    setMotorPins(FR_IN1, FR_IN2, -1);
+    setMotorPins(RL_IN1, RL_IN2, +1);
+    setMotorPins(RR_IN1, RR_IN2, -1);
+  } else { // STOP
+    stopAll();
+  }
+}
+
+// =====================================================
+// ================= MQTT STATUS PUBLISH ===============
+// =====================================================
+void publishStatusOnce() {
+  if (!client.connected()) return;
+
+  StaticJsonDocument<256> st;
+  st["version"] = currentFirmwareVersion;
+  st["enabled"] = motorEnabled ? "ENABLED" : "DISABLED";
+  st["move"]    = motorEnabled ? currentMove : "DISABLED";
+  st["ip"]      = WiFi.isConnected() ? WiFi.localIP().toString() : String("-");
+
+  String out;
+  serializeJson(st, out);
+
+  client.publish(topic_status, out.c_str(), true); // retained
+}
+
+// =====================================================
+// ================= MQTT CALLBACK =====================
+// =====================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+
+  String msg;
+  msg.reserve(length + 4);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  if (t == String(topic_control)) {
+    StaticJsonDocument<192> doc;
+    DeserializationError err = deserializeJson(doc, msg);
+    if (err) {
+      Serial.print("MQTT CTRL JSON error: ");
+      Serial.println(err.c_str());
+      return;
+    }
+
+    if (doc.containsKey("enable")) {
+      motorEnabled = doc["enable"].as<bool>();
+      if (!motorEnabled) currentMove = "STOP";
+    }
+
+    if (doc.containsKey("move")) {
+      String mv = doc["move"].as<String>();
+      mv.trim();
+      mv.toUpperCase();
+
+      if (mv == "FORWARD" || mv == "BACKWARD" || mv == "LEFT" || mv == "RIGHT" ||
+          mv == "STOP" || mv == "ROTATE_LEFT" || mv == "ROTATE_RIGHT") {
+        currentMove = mv;
+      } else {
+        currentMove = "STOP";
+      }
+    }
+
+    lastControlMsg = millis();
+
+    applyMove();
+    updateOLED();
+
+    publishStatusOnce(); // ✅ FIX: immediate status feedback for Netlify UI
+
+    Serial.print("MQTT CTRL OK: ");
+    Serial.println(msg);
+  }
+}
+
+// =====================================================
+// ================= MQTT CONNECT ======================
+// =====================================================
+void tryConnectMQTT() {
+  if (client.connected()) return;
+
+  if (millis() - lastMqttAttempt < 2000) return;
+  lastMqttAttempt = millis();
+
+  String clientId = "ESP32C5_ROBOCAR_";
+  clientId += String((uint32_t)esp_random(), HEX);
+
+  Serial.print("MQTT -> connecting... ");
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    Serial.println("OK");
+    mqttLine = "MQTT -> done";
+
+    client.subscribe(topic_control);
+    publishStatusOnce();
+  } else {
+    Serial.print("FAIL rc=");
+    Serial.println(client.state());
+    mqttLine = "MQTT -> fail";
+  }
+  updateOLED();
+}
+
+// =====================================================
+// ================= UART SENSORS ======================
+// =====================================================
+void handleUartLine(String line) {
+  line.trim();
+  if (!line.startsWith("{")) return;
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    Serial.print("UART JSON error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  rightDist = doc["right"] | -1;
+  frontDist = doc["front"] | -1;
+  leftDist  = doc["left"]  | -1;
+  rearDist  = doc["rear"]  | -1;
+
+  lastJson = line;
+
+  Serial.print("UART OK: ");
+  Serial.println(line);
+
+  if (client.connected()) {
+    client.publish(topic_sensors, line.c_str(), true);
+    Serial.println("MQTT Published");
+  }
+}
+
+// =====================================================
+// ================= WEB UI ============================
+// =====================================================
+String movePretty(const String& mv) {
+  if (!motorEnabled) return "DISABLED";
+  return mv;
+}
+
+void handleRoot() {
+  String html =
+    "<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<title>ROBOCAR</title>"
+    "<style>"
+    "body{font-family:Arial;margin:16px} h2{margin:0 0 10px 0}"
+    ".row{margin:8px 0}"
+    ".box{display:inline-block;padding:10px 14px;border:1px solid #aaa;border-radius:10px;margin:4px;min-width:120px;text-align:center}"
+    "button{padding:12px 14px;margin:4px;min-width:120px}"
+    ".grid{display:grid;grid-template-columns:repeat(3,140px);gap:8px;align-items:center;justify-content:start}"
+    ".muted{color:#666}"
+    "</style></head><body>"
+    "<h2>ROBOCAR CONTROL</h2>"
+
+    "<div class='row box'><b>Motor:</b> <span id='en'>-</span></div>"
+    "<div class='row box'><b>Move:</b> <span id='mv'>-</span></div>"
+    "<div class='row box'><b>Version:</b> <span id='ver'>-</span></div>"
+
+    "<div class='row'><button onclick=\"fetch('/toggle')\">Toggle Enable</button></div>"
+
+    "<h3>D-PAD</h3>"
+    "<div class='grid'>"
+      "<div></div><button onclick=\"cmd('FORWARD')\">FORWARD</button><div></div>"
+      "<button onclick=\"cmd('LEFT')\">LEFT</button><button onclick=\"cmd('STOP')\">STOP</button><button onclick=\"cmd('RIGHT')\">RIGHT</button>"
+      "<div></div><button onclick=\"cmd('BACKWARD')\">BACKWARD</button><div></div>"
+    "</div>"
+    "<div class='row'>"
+      "<button onclick=\"cmd('ROTATE_LEFT')\">ROTATE LEFT</button>"
+      "<button onclick=\"cmd('ROTATE_RIGHT')\">ROTATE RIGHT</button>"
+    "</div>"
+    "<p class='muted'>If motors are DISABLED, commands will not move.</p>"
+
+    "<h3>SENSORS</h3>"
+    "<div class='row box'><b>Right:</b> <span id='r'>-</span></div>"
+    "<div class='row box'><b>Front:</b> <span id='f'>-</span></div>"
+    "<div class='row box'><b>Left:</b> <span id='l'>-</span></div>"
+    "<div class='row box'><b>Rear:</b> <span id='b'>-</span></div>"
+    "<div class='row box' style='min-width:320px'><b>Last JSON:</b><br><code id='j'></code></div>"
+
+    "<script>"
+    "async function cmd(m){ await fetch('/move/'+m); }"
+    "async function upd(){"
+    " try{"
+    "  const res=await fetch('/status');"
+    "  const d=await res.json();"
+    "  document.getElementById('en').textContent=d.enabled;"
+    "  document.getElementById('mv').textContent=d.move;"
+    "  document.getElementById('ver').textContent=d.version;"
+    "  document.getElementById('r').textContent=d.right;"
+    "  document.getElementById('f').textContent=d.front;"
+    "  document.getElementById('l').textContent=d.left;"
+    "  document.getElementById('b').textContent=d.rear;"
+    "  document.getElementById('j').textContent=d.raw;"
+    " }catch(e){}"
+    "}"
+    "setInterval(upd,400); upd();"
+    "</script></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  StaticJsonDocument<384> out;
+  out["enabled"] = motorEnabled ? "ENABLED" : "DISABLED";
+  out["move"]    = movePretty(currentMove);
+  out["version"] = currentFirmwareVersion;
+  out["right"]   = rightDist;
+  out["front"]   = frontDist;
+  out["left"]    = leftDist;
+  out["rear"]    = rearDist;
+  out["raw"]     = lastJson;
+
+  String body;
+  serializeJson(out, body);
+  server.send(200, "application/json", body);
+}
+
+void handleToggle() {
+  motorEnabled = !motorEnabled;
+  if (!motorEnabled) currentMove = "STOP";
+
+  lastControlMsg = millis(); // keep watchdog happy
+
+  applyMove();
+  updateOLED();
+  publishStatusOnce();
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleMove() {
+  String uri = server.uri(); // e.g. /move/FORWARD
+  String cmd = uri.substring(String("/move/").length());
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd != "FORWARD" && cmd != "BACKWARD" && cmd != "LEFT" && cmd != "RIGHT" &&
+      cmd != "STOP" && cmd != "ROTATE_LEFT" && cmd != "ROTATE_RIGHT") {
+    cmd = "STOP";
+  }
+
+  if (!motorEnabled) currentMove = "STOP";
+  else currentMove = cmd;
+
+  lastControlMsg = millis(); // keep watchdog happy
+
+  applyMove();
+  updateOLED();
+  publishStatusOnce();
+
+  server.send(200, "text/plain", "OK");
+}
+
+// =====================================================
+// ================= PRIVATE OTA (PAT) =================
+// =====================================================
+bool parseVersionFromTag(String tag, String& out) {
+  tag.trim();
+  if (tag.length() == 0) return false;
+  if (tag[0] == 'v' || tag[0] == 'V') tag.remove(0, 1);
+  out = tag;
+  return true;
+}
+
+void checkForOTA() {
+  if (!WiFi.isConnected()) return;
+  if (millis() - lastUpdateCheck < updateCheckInterval) return;
+  lastUpdateCheck = millis();
+
+  otaLine = "OTA  -> checking";
+  Serial.println("\n===== PRIVATE OTA CHECK =====");
+  updateOLED();
+
+  // --- 1) Get latest release JSON ---
+  WiFiClientSecure net;
+  net.setInsecure();
+
+  HTTPClient http;
+  String apiUrl = "https://api.github.com/repos/" + String(github_owner) + "/" + String(github_repo) + "/releases/latest";
+
+  Serial.println("Requesting release...");
+  if (!http.begin(net, apiUrl)) {
+    Serial.println("OTA -> http.begin FAILED");
+    otaLine = "OTA  -> begin fail";
+    updateOLED();
+    return;
+  }
+
+  http.setUserAgent("ESP32-OTA-Client");
+  http.addHeader("Authorization", "token " + String(github_pat));
+  http.addHeader("Accept", "application/vnd.github.v3+json");
+
+  int code = http.GET();
+  Serial.print("Release HTTP: ");
+  Serial.println(code);
+
+  if (code != HTTP_CODE_OK) {
+    Serial.println("OTA -> Release fetch FAILED");
+    Serial.println(http.getString());
+    http.end();
+    otaLine = "OTA  -> rel fail";
+    updateOLED();
+    return;
+  }
+
+  StaticJsonDocument<8192> doc;
+  DeserializationError jerr = deserializeJson(doc, http.getStream());
+  http.end();
+  if (jerr) {
+    Serial.print("OTA -> JSON parse error: ");
+    Serial.println(jerr.c_str());
+    otaLine = "OTA  -> json fail";
+    updateOLED();
+    return;
+  }
+
+  String latest;
+  if (!parseVersionFromTag(doc["tag_name"].as<String>(), latest)) {
+    Serial.println("OTA -> missing tag_name");
+    otaLine = "OTA  -> no tag";
+    updateOLED();
+    return;
+  }
+
+  Serial.print("Latest: ");
+  Serial.println(latest);
+  Serial.print("Current: ");
+  Serial.println(currentFirmwareVersion);
+
+  if (latest == String(currentFirmwareVersion)) {
+    Serial.println("OTA -> Up to date");
+    otaLine = "OTA  -> up-to-date";
+    updateOLED();
+    return;
+  }
+
+  Serial.println("NEW VERSION DETECTED");
+  otaLine = "OTA  -> new ver";
+  updateOLED();
+
+  // --- 2) Find matching asset id ---
+  String assetId = "";
+  for (JsonObject a : doc["assets"].as<JsonArray>()) {
+    String nm = a["name"].as<String>();
+    if (nm == String(firmware_asset_name)) {
+      assetId = a["id"].as<String>();
+      break;
+    }
+  }
+
+  if (assetId.length() == 0) {
+    Serial.println("OTA -> asset not found");
+    otaLine = "OTA  -> no asset";
+    updateOLED();
+    return;
+  }
+
+  String fwUrl = "https://api.github.com/repos/" + String(github_owner) + "/" + String(github_repo) + "/releases/assets/" + assetId;
+
+  // --- 3) Download asset (octet-stream) with redirect follow ---
+  Serial.println("Downloading firmware...");
+  otaLine = "OTA  -> downloading";
+  updateOLED();
+
+  WiFiClientSecure fwClient;
+  fwClient.setInsecure();
+
+  HTTPClient fw;
+  fw.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  fw.setUserAgent("ESP32-OTA-Client");
+
+  if (!fw.begin(fwClient, fwUrl)) {
+    Serial.println("OTA -> fw.begin FAILED");
+    otaLine = "OTA  -> fw begin fail";
+    updateOLED();
+    return;
+  }
+
+  fw.addHeader("Authorization", "token " + String(github_pat));
+  fw.addHeader("Accept", "application/octet-stream");
+
+  int fwCode = fw.GET();
+  Serial.print("Firmware HTTP: ");
+  Serial.println(fwCode);
+
+  if (fwCode != HTTP_CODE_OK) {
+    Serial.println("Firmware download FAILED");
+    Serial.println(fw.getString());
+    fw.end();
+    otaLine = "OTA  -> fw  fail";
+    updateOLED();
+    return;
+  }
+
+  int contentLength = fw.getSize();
+  if (contentLength <= 0) {
+    Serial.println("OTA -> Invalid content length");
+    fw.end();
+    otaLine = "OTA  -> bad len";
+    updateOLED();
+    return;
+  }
+
+  // --- 4) Flash ---
+  Serial.println("Flashing...");
+  otaLine = "OTA  -> flashing";
+  updateOLED();
+
+  if (!Update.begin(contentLength)) {
+    Serial.print("Update.begin failed: ");
+    Serial.println(Update.errorString());
+    fw.end();
+    otaLine = "OTA  -> no space";
+    updateOLED();
+    return;
+  }
+
+  WiFiClient* stream = fw.getStreamPtr();
+  uint8_t buff[1024];
+  size_t totalWritten = 0;
+  int lastPct = -1;
+
+  while (totalWritten < (size_t)contentLength) {
+    int avail = stream->available();
+    if (avail > 0) {
+      int rd = stream->read(buff, (size_t)min(avail, (int)sizeof(buff)));
+      if (rd < 0) {
+        Serial.println("OTA -> stream read error");
+        Update.abort();
+        fw.end();
+        otaLine = "OTA  -> read err";
+        updateOLED();
+        return;
+      }
+
+      size_t wr = Update.write(buff, rd);
+      if (wr != (size_t)rd) {
+        Serial.print("OTA -> write error: ");
+        Serial.println(Update.errorString());
+        Update.abort();
+        fw.end();
+        otaLine = "OTA  -> write err";
+        updateOLED();
+        return;
+      }
+
+      totalWritten += wr;
+      int pct = (int)((totalWritten * 100UL) / (unsigned long)contentLength);
+      if (pct != lastPct && (pct % 5 == 0 || pct == 100)) {
+        Serial.print("Progress: ");
+        Serial.print(pct);
+        Serial.println("%");
+        lastPct = pct;
+      }
+    }
+    delay(1); // watchdog friendly
+  }
+
+  if (!Update.end()) {
+    Serial.print("OTA -> Update.end failed: ");
+    Serial.println(Update.errorString());
+    fw.end();
+    otaLine = "OTA  -> end fail";
+    updateOLED();
+    return;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("OTA -> not finished");
+    fw.end();
+    otaLine = "OTA  -> not fin";
+    updateOLED();
+    return;
+  }
+
+  fw.end();
+  Serial.println("OTA SUCCESS! Rebooting...");
+  otaLine = "OTA  -> success";
+  updateOLED();
+  delay(800);
+  ESP.restart();
+}
+
+// =====================================================
+// ================= SETUP / LOOP ======================
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  bootLine = "BOOT -> done";
+  wifiLine = "WIFI -> connecting";
+  mqttLine = "MQTT -> waiting";
+  otaLine  = "OTA  -> idle";
+
+  // UART from UNO
+  Serial1.begin(9600, SERIAL_8N1, ESP_RX, ESP_TX);
+  Serial1.setTimeout(20);
+  Serial.println("UART -> started RX=24 TX=23");
+
+  // Motors
+  pinMode(FL_IN1, OUTPUT); pinMode(FL_IN2, OUTPUT);
+  pinMode(FR_IN1, OUTPUT); pinMode(FR_IN2, OUTPUT);
+  pinMode(RL_IN1, OUTPUT); pinMode(RL_IN2, OUTPUT);
+  pinMode(RR_IN1, OUTPUT); pinMode(RR_IN2, OUTPUT);
+  stopAll();
+
+  // OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED -> init FAIL (addr 0x3C?)");
+  } else {
+    display.clearDisplay();
+    display.display();
+  }
+
+  // WiFi
+  Serial.println("WIFI -> connecting...");
+  WiFi.begin(ssid, password);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+    if (millis() - t0 > 20000) break; // 20s timeout
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiLine = "WIFI -> IP " + WiFi.localIP().toString();
+    Serial.println("\nWIFI -> connected");
+    Serial.println(WiFi.localIP());
+  } else {
+    wifiLine = "WIFI -> failed";
+    Serial.println("\nWIFI -> FAILED");
+  }
+
+  // MQTT TLS
+  espClient.setInsecure();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback); // NEW
+
+  // Web routes
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/toggle", handleToggle);
+  server.onNotFound([]() {
+    if (server.uri().startsWith("/move/")) { handleMove(); return; }
+    server.send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  Serial.println("WEB -> started");
+
+  // init watchdog timestamp
+  lastControlMsg = millis();
+
+  updateOLED();
+
+  // First MQTT attempt
+  tryConnectMQTT();
+
+  // First OTA check soon after boot (not immediate)
+  lastUpdateCheck = millis() - updateCheckInterval + 8000; // check in ~8s
+}
+
+void loop() {
+  // Web
+  server.handleClient();
+
+  // MQTT
+  tryConnectMQTT();
+  if (client.connected()) client.loop();
+
+  // Detect MQTT disconnect -> stop motors (safety)
+  bool nowConnected = client.connected();
+  if (wasMqttConnected && !nowConnected) {
+    Serial.println("MQTT -> disconnected, stopping motors");
+    motorEnabled = false;
+    currentMove = "STOP";
+    stopAll();
+    updateOLED();
+    publishStatusOnce();
+  }
+  wasMqttConnected = nowConnected;
+
+  // UART read
+  while (Serial1.available()) {
+    String line = Serial1.readStringUntil('\n');
+    if (line.length()) handleUartLine(line);
+  }
+
+  // SAFETY: if enabled and no recent control msg -> STOP (watchdog)
+  if (motorEnabled && (millis() - lastControlMsg > controlTimeout)) {
+    if (currentMove != "STOP") {
+      currentMove = "STOP";
+      applyMove();
+      updateOLED();
+      publishStatusOnce();
+    }
+  }
+
+  // OTA (periodic)
+  checkForOTA();
+
+  // Keep OLED fresh
+  static unsigned long lastOled = 0;
+  if (millis() - lastOled > 1000) {
+    lastOled = millis();
+    updateOLED();
+  }
+}
