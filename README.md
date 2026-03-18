@@ -112,4 +112,4 @@ The goal of this project was to:
 
 ## 👤 Author
 Edvárd Nagy  
-Kevin Kolervo
+Kevin Kovero
