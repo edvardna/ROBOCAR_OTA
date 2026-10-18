@@ -47,21 +47,12 @@
 #include <Adafruit_SSD1306.h>
 #include <HTTPClient.h>
 #include <Update.h>
-#include "secrets.h"   // must contain: const char* github_pat = "ghp_...";
+#include "secrets.h"   // must contain: ssid, password, mqtt_server, mqtt_user, mqtt_pass, github_pat (see "secrets - Copy.h"); ex: "ghp_...";
 
 // ================= WIFI =================
-const char* ssid     = "Galaxy A70B203";
-const char* password = "pnao7499";
-
-/*const char* ssid     = "EDWARD";
-const char* password = "Edward2000";*/
 
 // ================= HIVEMQ =================
-const char* mqtt_server = "459c3601de32431485cd34dbf54a23d2.s1.eu.hivemq.cloud";
 const int   mqtt_port   = 8883;
-const char* mqtt_user   = "robocar";
-const char* mqtt_pass   = "Robocar1!";
-
 const char* topic_sensors = "robocar/sensors";
 const char* topic_status  = "robocar/status";
 const char* topic_control = "robocar/control";
